@@ -14,7 +14,8 @@ app = Flask(__name__)
 
 # SECTION 1: HUGGING FACE INFERENCE API CONFIG
 # We offload the AI processing to Hugging Face to keep the deployment tiny (< 100MB).
-API_URL = "https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english"
+# Using the modern router endpoint for better reliability.
+API_URL = "https://router.huggingface.co/hf-inference/models/distilbert/distilbert-base-uncased-finetuned-sst-2-english"
 # If you have a token, add it here in your Vercel Environment Variables as HF_TOKEN
 HF_TOKEN = os.getenv("HF_TOKEN")
 headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
@@ -22,10 +23,14 @@ headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 def query_sentiment_api(payload):
     """Calls the Hugging Face Inference API for sentiment classification."""
     try:
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=10)
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=15)
+        # Log error if status is not 200
+        if response.status_code != 200:
+            print(f"API Error: Status {response.status_code}, Response: {response.text[:200]}")
+            return {"error_code": response.status_code, "message": response.text}
         return response.json()
     except Exception as e:
-        print(f"API Error: {e}")
+        print(f"Connection Error: {e}")
         return None
 
 # SECTION 2: DATASET CONFIGURATION
@@ -74,8 +79,15 @@ def analyze():
     api_results = query_sentiment_api({"inputs": review_texts, "options": {"wait_for_model": True}})
     
     if not api_results or not isinstance(api_results, list):
-        # Fallback if API is slow or errors out
-        return jsonify({"error": "Sentiment analysis service is currently busy. Please try again in a few seconds."}), 503
+        # Handle specific error cases
+        if isinstance(api_results, dict) and api_results.get("error_code") == 401:
+            return jsonify({"error": "Authentication failed. Please set a valid HF_TOKEN in your environment."}), 401
+        
+        # Fallback if API is slow, errors out, or rate limited
+        return jsonify({
+            "error": "The sentiment analysis service is currently unavailable or busy.",
+            "details": "This can happen if the model is loading or rate limits are reached. Please try again in a few seconds."
+        }), 503
 
     # Extract Product Metadata
     first_row = matched_reviews.iloc[0]
