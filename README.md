@@ -58,16 +58,11 @@ The `data_cleaning.py` script documents the cleaning steps:
 - Sampling for performance optimization.
 
 ## 🤝 Contributors
-- Satvik (@Satvik42)
-- [Teammate 1]
-- [Teammate 2]
-- [Teammate 3]
+The following members have contributed to the core features, data preprocessing, and UI/UX of this project:
+- **Satvik** (@Satvik42) - Lead Developer
+- **Tanush** (@JustforCode28) - Data Preprocessing & Documentation
+- **Varshini** (@varshininisharohith-ui) - Model Evaluation & Metrics
+- **Tharun Gowda** (@Tharungowda23) - Installation Guide & Setup
 
 ## 📜 License
-MIT License
-
-# Documentation Update by JustforCode28
-
-# Model Metrics Update by varshininisharohith-ui
-
-# Installation Guide Update by Tharungowda23
+This project is licensed under the **MIT License**. The license covers all contributions and commits made by the team members listed above.
