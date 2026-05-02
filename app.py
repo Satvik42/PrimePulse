@@ -1,34 +1,38 @@
 from flask import Flask, request, jsonify, render_template
 import pandas as pd
-from transformers import pipeline
+import requests
 import collections
 import os
 
 """
-PRODUCT SENTIMENT ANALYZER - MAIN APPLICATION
-This script initializes the Flask server, loads the NLP model, 
-and provides endpoints for product sentiment analysis.
+PRODUCT SENTIMENT ANALYZER - VERCEL OPTIMIZED
+This version uses the Hugging Face Inference API instead of local transformers
+to stay within Vercel's serverless size and memory limits.
 """
 
 app = Flask(__name__)
 
-# SECTION 1: GLOBAL MODEL LOADING
-# We load the model once at startup to avoid overhead on every request.
-# Model: distilbert-base-uncased-finetuned-sst-2-english
-# Purpose: High-speed, high-accuracy binary sentiment classification.
-print("Loading NLP Model...")
-sentiment_pipeline = pipeline(
-    "sentiment-analysis", 
-    model="distilbert-base-uncased-finetuned-sst-2-english"
-)
-print("Model loaded successfully!")
+# SECTION 1: HUGGING FACE INFERENCE API CONFIG
+# We offload the AI processing to Hugging Face to keep the deployment tiny (< 100MB).
+API_URL = "https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english"
+# If you have a token, add it here in your Vercel Environment Variables as HF_TOKEN
+HF_TOKEN = os.getenv("HF_TOKEN")
+headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+
+def query_sentiment_api(payload):
+    """Calls the Hugging Face Inference API for sentiment classification."""
+    try:
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"API Error: {e}")
+        return None
 
 # SECTION 2: DATASET CONFIGURATION
-# Load the Amazon reviews dataset using Pandas for efficient searching.
 CSV_FILENAME = "reviews.csv" 
-PRODUCT_COLUMN_NAME = "name"          # Column for product search
-REVIEW_COLUMN_NAME = "reviews.text"   # Column containing review body
-RATING_COLUMN_NAME = "reviews.rating" # Column containing numeric rating
+PRODUCT_COLUMN_NAME = "name"
+REVIEW_COLUMN_NAME = "reviews.text"
+RATING_COLUMN_NAME = "reviews.rating"
 
 print(f"Loading dataset from {CSV_FILENAME}...")
 try:
@@ -36,59 +40,44 @@ try:
         df = pd.read_csv(CSV_FILENAME, low_memory=False)
         print(f"Successfully loaded {len(df)} reviews from {CSV_FILENAME}")
     else:
-        print(f"WARNING: {CSV_FILENAME} not found. Creating a blank dataframe.")
         df = pd.DataFrame(columns=[PRODUCT_COLUMN_NAME, REVIEW_COLUMN_NAME, RATING_COLUMN_NAME])
 except Exception as e:
-    print(f"Error loading CSV: {e}")
     df = pd.DataFrame(columns=[PRODUCT_COLUMN_NAME, REVIEW_COLUMN_NAME, RATING_COLUMN_NAME])
 
 # SECTION 3: ROUTES
 @app.route('/')
 def home():
-    """
-    Renders the main dashboard landing page.
-    """
     return render_template('index.html')
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """
-    Inference endpoint:
-    1. Receives product name from the frontend.
-    2. Filters the dataset for matching reviews.
-    3. Runs batch inference using the Transformers pipeline.
-    4. Aggregates results (stats, product info, sample reviews).
-    5. Returns JSON response.
-    """
     data = request.get_json()
     product_query = data.get('product', '').strip()
     
     if not product_query:
         return jsonify({"error": "Please enter a product name."}), 400
         
-    # DATA SEARCH: Case-insensitive partial string matching
     mask = df[PRODUCT_COLUMN_NAME].astype(str).str.contains(product_query, case=False, na=False)
     matched_reviews = df[mask]
     
     if matched_reviews.empty:
         return jsonify({"error": f"No reviews found for '{product_query}'."}), 404
         
-    # PERFORMANCE OPTIMIZATION: Limit to 50 reviews for real-time response
     sampled_reviews = matched_reviews.head(50)
     review_texts = sampled_reviews[REVIEW_COLUMN_NAME].astype(str).fillna("").tolist()
-    
-    # Filter empty strings
     review_texts = [text for text in review_texts if text.strip()]
+    
     if not review_texts:
          return jsonify({"error": "Found products, but review text is empty."}), 404
 
-    # BATCH INFERENCE: Process reviews in chunks of 16 for speed
-    try:
-        results = sentiment_pipeline(review_texts, batch_size=16, truncation=True, max_length=512)
-    except Exception as e:
-        return jsonify({"error": f"Error during model inference: {str(e)}"}), 500
-        
-    # PRODUCT METADATA EXTRACTION (Glimpse)
+    # CALL HUGGING FACE API (Batch Processing)
+    api_results = query_sentiment_api({"inputs": review_texts, "options": {"wait_for_model": True}})
+    
+    if not api_results or not isinstance(api_results, list):
+        # Fallback if API is slow or errors out
+        return jsonify({"error": "Sentiment analysis service is currently busy. Please try again in a few seconds."}), 503
+
+    # Extract Product Metadata
     first_row = matched_reviews.iloc[0]
     brand = str(first_row.get('brand', 'Unknown'))
     categories = str(first_row.get('categories', 'N/A'))
@@ -96,8 +85,24 @@ def analyze():
     if source_url and ',' in source_url:
         source_url = source_url.split(',')[0].strip().replace('"', '').replace('[', '').replace(']', '')
     
-    # DATA AGGREGATION & STATS
-    sentiments = [res['label'] for res in results]
+    # AGGREGATE RESULTS
+    # The API returns labels like 'POSITIVE' or 'NEGATIVE' in a nested list/dict
+    sentiments = []
+    processed_reviews = []
+    
+    for text, res_list in zip(review_texts, api_results):
+        # API usually returns a list of results for each input, pick the highest score
+        top_res = max(res_list, key=lambda x: x['score'])
+        label = top_res['label']
+        score = top_res['score']
+        
+        sentiments.append(label)
+        processed_reviews.append({
+            "text": text,
+            "sentiment": label,
+            "score": round(score, 3)
+        })
+    
     sentiment_counts = collections.Counter(sentiments)
     total_reviews = len(sentiments)
     positive_count = sentiment_counts.get("POSITIVE", 0)
@@ -106,18 +111,8 @@ def analyze():
     percent_positive = round((positive_count / total_reviews) * 100, 1) if total_reviews > 0 else 0
     percent_negative = round((negative_count / total_reviews) * 100, 1) if total_reviews > 0 else 0
     
-    # Calculate Average Rating from dataset
     avg_rating = matched_reviews[RATING_COLUMN_NAME].mean()
     avg_rating = round(float(avg_rating), 1) if not pd.isna(avg_rating) else 0.0
-    
-    # PAYLOAD PREPARATION
-    reviews_data = []
-    for text, res in zip(review_texts, results):
-        reviews_data.append({
-            "text": text,
-            "sentiment": res['label'],
-            "score": round(res['score'], 3)
-        })
         
     return jsonify({
         "product_info": {
@@ -135,9 +130,8 @@ def analyze():
             "negative_count": negative_count,
             "average_rating": avg_rating
         },
-        "reviews": reviews_data
+        "reviews": processed_reviews
     })
 
 if __name__ == '__main__':
-    # Launch Flask development server
     app.run(debug=True, port=5000)
