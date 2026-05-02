@@ -69,3 +69,5 @@ MIT License
 # Documentation Update by JustforCode28
 
 # Model Metrics Update by varshininisharohith-ui
+
+# Installation Guide Update by Tharungowda23
