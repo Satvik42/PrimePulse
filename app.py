@@ -17,7 +17,7 @@ app = Flask(__name__)
 # Using the modern router endpoint for better reliability.
 API_URL = "https://router.huggingface.co/hf-inference/models/distilbert/distilbert-base-uncased-finetuned-sst-2-english"
 # If you have a token, add it here in your Vercel Environment Variables as HF_TOKEN
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 def query_sentiment_api(payload):
@@ -68,7 +68,8 @@ def analyze():
     if matched_reviews.empty:
         return jsonify({"error": f"No reviews found for '{product_query}'."}), 404
         
-    sampled_reviews = matched_reviews.head(50)
+    # Reduce sample size to avoid Hugging Face Inference API payload limits/timeouts
+    sampled_reviews = matched_reviews.head(15)
     review_texts = sampled_reviews[REVIEW_COLUMN_NAME].astype(str).fillna("").tolist()
     review_texts = [text for text in review_texts if text.strip()]
     
