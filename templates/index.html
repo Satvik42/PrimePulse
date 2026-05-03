@@ -611,6 +611,10 @@
             </div>
         </div>
 
+        <div id="fallbackNotice" class="badge" style="display: none; background: rgba(245, 158, 11, 0.1); color: #f59e0b; border-color: rgba(245, 158, 11, 0.2); margin-top: 1rem; width: 100%; box-sizing: border-box;">
+            ⚠️ Using simplified local analysis due to high API load.
+        </div>
+
         <div id="errorMessage" class="error-message"></div>
         
         <div id="loading" class="loading-spinner">
@@ -738,6 +742,7 @@
                 }
 
                 // Update UI with incoming JSON data
+                document.getElementById("fallbackNotice").style.display = data.using_fallback ? "block" : "none";
                 updateDashboard(data);
 
             } catch (error) {

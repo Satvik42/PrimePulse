@@ -1,8 +1,10 @@
-from flask import Flask, request, jsonify, render_template
 import pandas as pd
 import requests
 import collections
 import os
+import time
+import re
+from flask import Flask, render_template, request, jsonify
 
 """
 PRODUCT SENTIMENT ANALYZER - VERCEL OPTIMIZED
@@ -13,25 +15,52 @@ to stay within Vercel's serverless size and memory limits.
 app = Flask(__name__)
 
 # SECTION 1: HUGGING FACE INFERENCE API CONFIG
-# We offload the AI processing to Hugging Face to keep the deployment tiny (< 100MB).
-# Using the modern router endpoint for better reliability.
-API_URL = "https://router.huggingface.co/hf-inference/models/distilbert/distilbert-base-uncased-finetuned-sst-2-english"
-# If you have a token, add it here in your Vercel Environment Variables as HF_TOKEN
+# Using a more stable and popular model: twitter-roberta-base-sentiment-latest
+API_URL = "https://router.huggingface.co/hf-inference/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-def query_sentiment_api(payload):
-    """Calls the Hugging Face Inference API for sentiment classification."""
-    try:
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=15)
-        # Log error if status is not 200
-        if response.status_code != 200:
+def local_sentiment_fallback(text):
+    """Simple rule-based sentiment analysis as a fallback."""
+    pos_words = {'good', 'great', 'excellent', 'love', 'perfect', 'amazing', 'best', 'awesome', 'happy', 'satisfied', 'nice'}
+    neg_words = {'bad', 'terrible', 'awful', 'hate', 'worst', 'poor', 'disappointed', 'broke', 'broken', 'expensive', 'useless'}
+    
+    text_lower = text.lower()
+    pos_count = sum(1 for word in pos_words if word in text_lower)
+    neg_count = sum(1 for word in neg_words if word in text_lower)
+    
+    if pos_count >= neg_count:
+        return 'positive', min(0.5 + (pos_count - neg_count) * 0.1, 0.99)
+    else:
+        return 'negative', min(0.5 + (neg_count - pos_count) * 0.1, 0.99)
+
+def query_sentiment_api(payload, retries=2):
+    """Calls the Hugging Face Inference API with retries for loading models."""
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=20)
+            result = response.json()
+            
+            if response.status_code == 200:
+                return result
+            
+            # If model is loading, wait and retry
+            if response.status_code == 503 and 'loading' in str(result).lower():
+                wait_time = result.get('estimated_time', 10)
+                print(f"Model loading... waiting {wait_time}s (Attempt {attempt+1}/{retries+1})")
+                time.sleep(min(wait_time, 15))
+                continue
+                
             print(f"API Error: Status {response.status_code}, Response: {response.text[:200]}")
             return {"error_code": response.status_code, "message": response.text}
-        return response.json()
-    except Exception as e:
-        print(f"Connection Error: {e}")
-        return None
+            
+        except Exception as e:
+            print(f"Connection Error on attempt {attempt+1}: {e}")
+            if attempt < retries:
+                time.sleep(2)
+                continue
+            return None
+    return None
 
 # SECTION 2: DATASET CONFIGURATION
 CSV_FILENAME = "reviews.csv" 
@@ -76,45 +105,42 @@ def analyze():
     if not review_texts:
          return jsonify({"error": "Found products, but review text is empty."}), 404
 
+    # Extract product info for the dashboard
+    first_row = matched_reviews.iloc[0]
+    brand = str(first_row.get('brand', 'Generic'))
+    categories = str(first_row.get('categories', 'Product'))
+    source_url = str(first_row.get('reviews.sourceURLs', '#')).split(',')[0].strip() # Take first URL if multiple
+
     # CALL HUGGING FACE API (Batch Processing)
     api_results = query_sentiment_api({"inputs": review_texts, "options": {"wait_for_model": True}})
     
-    if not api_results or not isinstance(api_results, list):
-        # Handle specific error cases
-        if isinstance(api_results, dict) and api_results.get("error_code") == 401:
-            return jsonify({"error": "Authentication failed. Please set a valid HF_TOKEN in your environment."}), 401
-        
-        # Fallback if API is slow, errors out, or rate limited
-        return jsonify({
-            "error": "The sentiment analysis service is currently unavailable or busy.",
-            "details": "This can happen if the model is loading or rate limits are reached. Please try again in a few seconds."
-        }), 503
-
-    # Extract Product Metadata
-    first_row = matched_reviews.iloc[0]
-    brand = str(first_row.get('brand', 'Unknown'))
-    categories = str(first_row.get('categories', 'N/A'))
-    source_url = str(first_row.get('reviews.sourceURLs', ''))
-    if source_url and ',' in source_url:
-        source_url = source_url.split(',')[0].strip().replace('"', '').replace('[', '').replace(']', '')
-    
-    # AGGREGATE RESULTS
-    # The API returns labels like 'POSITIVE' or 'NEGATIVE' in a nested list/dict
-    sentiments = []
+    using_fallback = False
     processed_reviews = []
-    
-    for text, res_list in zip(review_texts, api_results):
-        # API usually returns a list of results for each input, pick the highest score
-        top_res = max(res_list, key=lambda x: x['score'])
-        label = top_res['label']
-        score = top_res['score']
-        
-        sentiments.append(label)
-        processed_reviews.append({
-            "text": text,
-            "sentiment": label,
-            "score": round(score, 3)
-        })
+    sentiments = []
+
+    if api_results and isinstance(api_results, list):
+        # NORMAL API PROCESSING
+        for text, res_list in zip(review_texts, api_results):
+            # Roberta model returns labels like 'positive', 'neutral', 'negative'
+            # We map them to POSITIVE/NEGATIVE for consistency with existing UI
+            top_res = max(res_list, key=lambda x: x['score'])
+            label = top_res['label'].upper()
+            if label == 'LABEL_2' or label == 'POSITIVE': label = 'POSITIVE'
+            elif label == 'LABEL_0' or label == 'NEGATIVE': label = 'NEGATIVE'
+            else: label = 'POSITIVE' # Map neutral to positive for binary display
+            
+            score = top_res['score']
+            sentiments.append(label)
+            processed_reviews.append({"text": text, "sentiment": label, "score": round(score, 3)})
+    else:
+        # FALLBACK PROCESSING (If API fails)
+        print("API Failed. Using local fallback analysis.")
+        using_fallback = True
+        for text in review_texts:
+            label, score = local_sentiment_fallback(text)
+            label = label.upper()
+            sentiments.append(label)
+            processed_reviews.append({"text": text, "sentiment": label, "score": round(score, 3)})
     
     sentiment_counts = collections.Counter(sentiments)
     total_reviews = len(sentiments)
@@ -143,7 +169,8 @@ def analyze():
             "negative_count": negative_count,
             "average_rating": avg_rating
         },
-        "reviews": processed_reviews
+        "reviews": processed_reviews,
+        "using_fallback": using_fallback
     })
 
 if __name__ == '__main__':
