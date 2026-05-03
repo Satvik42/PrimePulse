@@ -22,17 +22,20 @@ headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 def local_sentiment_fallback(text):
     """Simple rule-based sentiment analysis as a fallback."""
-    pos_words = {'good', 'great', 'excellent', 'love', 'perfect', 'amazing', 'best', 'awesome', 'happy', 'satisfied', 'nice'}
-    neg_words = {'bad', 'terrible', 'awful', 'hate', 'worst', 'poor', 'disappointed', 'broke', 'broken', 'expensive', 'useless'}
+    pos_words = {'good', 'great', 'excellent', 'love', 'perfect', 'amazing', 'best', 'awesome', 'happy', 'satisfied', 'nice', 'helpful', 'fast', 'easy'}
+    neg_words = {'bad', 'terrible', 'awful', 'hate', 'worst', 'poor', 'disappointed', 'broke', 'broken', 'expensive', 'useless', 'slow', 'waste'}
     
     text_lower = text.lower()
     pos_count = sum(1 for word in pos_words if word in text_lower)
     neg_count = sum(1 for word in neg_words if word in text_lower)
     
-    if pos_count >= neg_count:
+    if pos_count > neg_count:
         return 'positive', min(0.5 + (pos_count - neg_count) * 0.1, 0.99)
-    else:
+    elif neg_count > pos_count:
         return 'negative', min(0.5 + (neg_count - pos_count) * 0.1, 0.99)
+    else:
+        # For neutral/ambiguous text, default to positive with low confidence
+        return 'positive', 0.5
 
 def query_sentiment_api(payload, retries=2):
     """Calls the Hugging Face Inference API with retries for loading models."""
@@ -97,8 +100,8 @@ def analyze():
     if matched_reviews.empty:
         return jsonify({"error": f"No reviews found for '{product_query}'."}), 404
         
-    # Reduce sample size to avoid Hugging Face Inference API payload limits/timeouts
-    sampled_reviews = matched_reviews.head(15)
+    # Sample reviews randomly to get a more representative sentiment distribution
+    sampled_reviews = matched_reviews.sample(min(15, len(matched_reviews)))
     review_texts = sampled_reviews[REVIEW_COLUMN_NAME].astype(str).fillna("").tolist()
     review_texts = [text for text in review_texts if text.strip()]
     
@@ -118,27 +121,38 @@ def analyze():
     processed_reviews = []
     sentiments = []
 
-    if api_results and isinstance(api_results, list):
+    if api_results and isinstance(api_results, list) and len(api_results) > 0 and isinstance(api_results[0], list):
         # NORMAL API PROCESSING
         for text, res_list in zip(review_texts, api_results):
             # Roberta model returns labels like 'positive', 'neutral', 'negative'
-            # We map them to POSITIVE/NEGATIVE for consistency with existing UI
             top_res = max(res_list, key=lambda x: x['score'])
             label = top_res['label'].upper()
-            if label == 'LABEL_2' or label == 'POSITIVE': label = 'POSITIVE'
-            elif label == 'LABEL_0' or label == 'NEGATIVE': label = 'NEGATIVE'
-            else: label = 'POSITIVE' # Map neutral to positive for binary display
+            if label in ['LABEL_2', 'POSITIVE', 'POS']: label = 'POSITIVE'
+            elif label in ['LABEL_0', 'NEGATIVE', 'NEG']: label = 'NEGATIVE'
+            else: label = 'POSITIVE' # Map neutral to positive
             
             score = top_res['score']
             sentiments.append(label)
             processed_reviews.append({"text": text, "sentiment": label, "score": round(score, 3)})
-    else:
-        # FALLBACK PROCESSING (If API fails)
-        print("API Failed. Using local fallback analysis.")
+    
+    # If API failed or returned unexpected format, use fallback
+    if not processed_reviews:
+        print("API Failed or timed out. Using local fallback analysis.")
         using_fallback = True
-        for text in review_texts:
-            label, score = local_sentiment_fallback(text)
-            label = label.upper()
+        for i, text in enumerate(review_texts):
+            # 1. Use rating from dataset for high accuracy during fallback
+            raw_rating = sampled_reviews.iloc[i].get(RATING_COLUMN_NAME)
+            rating = float(raw_rating) if pd.notna(raw_rating) else 0
+            
+            if rating >= 4:
+                label, score = 'POSITIVE', 0.95
+            elif 0 < rating <= 2:
+                label, score = 'NEGATIVE', 0.95
+            else:
+                # 2. Keyword matching if rating is neutral (3) or missing (0)
+                label, score = local_sentiment_fallback(text)
+                label = label.upper()
+            
             sentiments.append(label)
             processed_reviews.append({"text": text, "sentiment": label, "score": round(score, 3)})
     
