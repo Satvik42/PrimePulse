@@ -1,4 +1,4 @@
-# Product Sentiment AI 
+# PrimePulse AI 
 
 A professional, real-time product review sentiment analyzer built with Python, Flask, and Deep Learning (Transformers). This tool allows users to search for products, visualize customer sentiment, and get a direct glimpse of product details.
 
