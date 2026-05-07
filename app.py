@@ -103,12 +103,16 @@ def analyze():
     if matched_reviews.empty:
         return jsonify({"error": f"No reviews found for '{product_query}'."}), 404
         
+    TOTAL_SAMPLE_SIZE = 150
+    API_BATCH_SIZE = 15
+
     # Sample reviews randomly to get a more representative sentiment distribution
-    sampled_reviews = matched_reviews.sample(min(15, len(matched_reviews)))
-    review_texts = sampled_reviews[REVIEW_COLUMN_NAME].astype(str).fillna("").tolist()
-    review_texts = [text for text in review_texts if text.strip()]
+    sampled_reviews = matched_reviews.sample(min(TOTAL_SAMPLE_SIZE, len(matched_reviews)))
     
-    if not review_texts:
+    # Filter out empty reviews while preserving index alignment
+    valid_reviews = sampled_reviews[sampled_reviews[REVIEW_COLUMN_NAME].astype(str).str.strip() != ""].copy()
+    
+    if valid_reviews.empty:
          return jsonify({"error": "Found products, but review text is empty."}), 404
 
     # Extract product info for the dashboard
@@ -117,47 +121,81 @@ def analyze():
     categories = str(first_row.get('categories', 'Product'))
     source_url = str(first_row.get('reviews.sourceURLs', '#')).split(',')[0].strip() # Take first URL if multiple
 
-    # CALL HUGGING FACE API (Batch Processing)
-    api_results = query_sentiment_api({"inputs": review_texts, "options": {"wait_for_model": True}})
+    # Create numeric rating column for filtering
+    valid_reviews['numeric_rating'] = pd.to_numeric(valid_reviews[RATING_COLUMN_NAME], errors='coerce').fillna(5)
+    
+    # Attempt to get a balanced mix of negative/positive reviews for the API (UI Highlights)
+    neg_reviews = valid_reviews[valid_reviews['numeric_rating'] <= 3]
+    pos_reviews = valid_reviews[valid_reviews['numeric_rating'] >= 4]
+
+    neg_sample = neg_reviews.head(7)
+    pos_sample = pos_reviews.head(API_BATCH_SIZE - len(neg_sample))
+    
+    # If we don't have enough positive, fill with negative and vice versa just in case
+    if len(pos_sample) + len(neg_sample) < API_BATCH_SIZE and len(valid_reviews) >= API_BATCH_SIZE:
+        api_batch_df = valid_reviews.head(API_BATCH_SIZE)
+    else:
+        api_batch_df = pd.concat([neg_sample, pos_sample]).sample(frac=1) # Shuffle
+    
+    api_indices = api_batch_df.index
+    local_batch_df = valid_reviews.drop(api_indices)
+
+    api_batch_texts = api_batch_df[REVIEW_COLUMN_NAME].astype(str).tolist()
+    api_batch_ratings = api_batch_df['numeric_rating'].tolist()
+    
+    local_batch_texts = local_batch_df[REVIEW_COLUMN_NAME].astype(str).tolist()
+    local_batch_ratings = local_batch_df['numeric_rating'].tolist()
+    
+    # CALL HUGGING FACE API (Batch Processing) on smaller subset
+    api_results = query_sentiment_api({"inputs": api_batch_texts, "options": {"wait_for_model": True}})
     
     using_fallback = False
     processed_reviews = []
     sentiments = []
 
+    # Process API Results for the first batch
     if api_results and isinstance(api_results, list) and len(api_results) > 0 and isinstance(api_results[0], list):
         # NORMAL API PROCESSING
-        for text, res_list in zip(review_texts, api_results):
-            # Roberta model returns labels like 'positive', 'neutral', 'negative'
+        for text, res_list in zip(api_batch_texts, api_results):
             top_res = max(res_list, key=lambda x: x['score'])
             label = top_res['label'].upper()
             if label in ['LABEL_2', 'POSITIVE', 'POS']: label = 'POSITIVE'
             elif label in ['LABEL_0', 'NEGATIVE', 'NEG']: label = 'NEGATIVE'
-            else: label = 'POSITIVE' # Map neutral to positive
+            else: label = 'POSITIVE'
             
             score = top_res['score']
             sentiments.append(label)
             processed_reviews.append({"text": text, "sentiment": label, "score": round(score, 3)})
-    
-    # If API failed or returned unexpected format, use fallback
-    if not processed_reviews:
-        print("API Failed or timed out. Using local fallback analysis.")
+    else:
+        print("API Failed or timed out. Using local fallback analysis for all reviews.")
         using_fallback = True
-        for i, text in enumerate(review_texts):
-            # 1. Use rating from dataset for high accuracy during fallback
-            raw_rating = sampled_reviews.iloc[i].get(RATING_COLUMN_NAME)
-            rating = float(raw_rating) if pd.notna(raw_rating) else 0
+        for i, text in enumerate(api_batch_texts):
+            rating = api_batch_ratings[i]
             
             if rating >= 4:
                 label, score = 'POSITIVE', 0.95
-            elif 0 < rating <= 2:
+            elif 0 < rating <= 3:
                 label, score = 'NEGATIVE', 0.95
             else:
-                # 2. Keyword matching if rating is neutral (3) or missing (0)
                 label, score = local_sentiment_fallback(text)
                 label = label.upper()
             
             sentiments.append(label)
             processed_reviews.append({"text": text, "sentiment": label, "score": round(score, 3)})
+
+    # Process remaining reviews locally (hybrid approach)
+    for i, text in enumerate(local_batch_texts):
+        rating = local_batch_ratings[i]
+        
+        if rating >= 4:
+            label = 'POSITIVE'
+        elif 0 < rating <= 3:
+            label = 'NEGATIVE'
+        else:
+            label, _ = local_sentiment_fallback(text)
+            label = label.upper()
+        
+        sentiments.append(label)
     
     sentiment_counts = collections.Counter(sentiments)
     total_reviews = len(sentiments)
